@@ -1,0 +1,62 @@
+---
+title: "Setup"
+author: "Thomas McManus"
+date: "24/08/2019"
+output: html_document
+editor_options: 
+    chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+install.packages("future")
+devtools::install_github("abresler/nbastatR")
+```
+
+### Test 
+
+```{r}
+library(nbastatR)
+library(future)
+library(tidyverse)
+
+plan(multiprocess)
+
+logs_2019 <- nbastatR::game_logs(seasons = 2019)
+
+glimpse(logs_2019)
+
+```
+
+#### game_logs returns one row for each player that played in each game in a given season
+
+```{r}
+logs_2019 %>% count(idGame)
+```
+
+
+### Test play_by_play
+
+```{r}
+ids <- unique(logs_2019$idGame)[1:10]
+
+play_by_play_sample <- play_by_play(ids)
+
+glimpse(play_by_play_sample)
+  
+```
+
+
+```{r}
+play_by_play_sample %>% 
+  summarize(
+    home_events = sum(!is.na(descriptionPlayHome)), 
+    visitor_events = sum(!is.na(descriptionPlayHome)), 
+    both_events = sum(!is.na(descriptionPlayHome) &
+                        !is.na(descriptionPlayVisitor))
+  )
+```
+
