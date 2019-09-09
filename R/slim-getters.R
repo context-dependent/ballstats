@@ -8,9 +8,11 @@ get_posessions <- function(GameID = "0021800001") {
 
 # slim play-by-play-v2
 
-get_play_by_play <- function(GameID = "0021800001", StartPeriod=0, EndPeriod = 14) {
+get_play_by_play <- function(GameID = "0021800001", StartPeriod=0, EndPeriod = 14, browse = FALSE) {
 
-  raw <- make_nba_stats_request(endpoint = "playbyplayv2", GameID = GameID, StartPeriod = StartPeriod, EndPeriod = EndPeriod)
+  if(browse) browser()
+
+  raw <- make_nba_stats_request(endpoint = "playbyplayv2", GameID = GameID, StartPeriod = StartPeriod, EndPeriod = EndPeriod, browse = browse)
 
   data <- raw$resultSet$rowSet[[1]]
 
@@ -21,6 +23,41 @@ get_play_by_play <- function(GameID = "0021800001", StartPeriod=0, EndPeriod = 1
   res <- tibble::as_tibble(data)
 
   res
+
+}
+
+get_season_games <- function(Season = "2017-18") {
+
+  raw <- make_nba_stats_request(
+    endpoint = "leaguegamelog",
+    Season = Season,
+    LeagueID = "00",
+    PlayerOrTeam = "T",
+    Direction = "DESC",
+    SeasonType = "Regular Season",
+    Sorter = "DATE"
+
+    # , browse = TRUE
+
+    #, debug_url = TRUE
+  )
+
+  dat <- raw$resultSets$rowSet[[1]]
+
+  column_names <- raw$resultSets$headers[[1]]
+
+  colnames(dat) <- column_names
+
+  res <- as_tibble(dat)
+
+  res
+}
+
+clean_season_games <- function(season_games) {
+
+  season_games %>%
+
+    janitor::clean_names()
 
 }
 
@@ -36,6 +73,7 @@ clean_game_time <- function(period, time_remaining) {
   res
 
 }
+
 clean_posessions <- function(play_by_play_data) {
 
 
@@ -46,7 +84,7 @@ clean_posessions <- function(play_by_play_data) {
   dat <- play_by_play_data %>%
 
     filter(
-      !(event_category %in% c("Steal", "Block"))
+      !(event_category %in% c("Steal", "Block", "Substitution"))
     ) %>%
   # posessions change on:
   # - made shots
@@ -70,7 +108,11 @@ clean_posessions <- function(play_by_play_data) {
     group_by(posession_number) %>%
 
     mutate(
-      posession_team = first(player_team)
+      posession_team = first(player_team),
+      event_category = case_when(
+        event_category == "Rebound Opportunity" ~ str_c(event_category, event_detail, sep = " "),
+        TRUE ~ event_category
+      )
     ) %>%
 
     group_by(
@@ -82,12 +124,15 @@ clean_posessions <- function(play_by_play_data) {
     nest() %>%
 
     mutate(
-      shot = data %>% map(~ .x %>% filter(event_category %in% "Field Goal Attempt")),
+      data = data %>% map(drop_events_before_time_out),
+      shot = data %>% map(~ .x %>% filter(event_category %in% c("Field Goal Attempt", "Free Throws"))),
       posession_end_event = data %>% map_chr(~ .x %>% pull(event_category) %>% last()),
-      posession_start_event = lag(posession_end_event)
+      posession_start_event = lag(posession_end_event, default = "Tip-off"),
+      posession_time_out = data %>% map_lgl(~ "Time Out" %in% .x$event_category),
+      posession_start_event = ifelse(posession_time_out, "Time Out", posession_start_event)
     ) %>%
-    select(
-      -data
+    rename(
+      plays = data
     ) %>%
     unnest(shot) %>%
     mutate(
@@ -106,9 +151,12 @@ clean_posessions <- function(play_by_play_data) {
       everything()
     )
 
+  res <- dat
+
+  res
+
 
 }
-
 
 clean_play_by_play <- function(play_by_play_response) {
 
@@ -153,7 +201,10 @@ clean_play_by_play <- function(play_by_play_response) {
     steals = clean_steals(dat),
 
     # substitutions
-    substitutions = clean_substitutions(dat)
+    substitutions = clean_substitutions(dat),
+
+    # timeouts
+    timeouts = clean_timeouts(dat)
 
   )
 
@@ -165,8 +216,56 @@ clean_play_by_play <- function(play_by_play_response) {
       player_id, player_name, player_team,
       period, seconds_played, everything()
     ) %>%
+    fill_players_on_court() %>%
     drop_first_ft_rebounds() %>%
     fill_home_away_teams()
+
+  res
+
+}
+
+clean_timeouts <- function(dat) {
+
+  team_id_dictionary <- dat %>%
+
+    select(
+      player_team_id = player1_team_id,
+      player_team = player1_team_abbreviation
+    ) %>%
+
+    group_by_all() %>%
+    slice(1) %>%
+
+    ungroup()
+
+
+  res <- dat %>%
+
+    filter(
+      event_type_label == "time out"
+    ) %>%
+
+    select(
+      event_id,
+      seconds_played,
+      event_type_label,
+      player_type = person1type,
+      player_team_id = player1_id
+    ) %>%
+
+    left_join(
+      team_id_dictionary
+    ) %>%
+
+    mutate(event_category = "Time Out") %>%
+
+    rename(
+      player_id = player_team_id
+    ) %>%
+
+    select(
+      -event_type_label
+    )
 
   res
 
@@ -202,7 +301,7 @@ clean_substitutions <- function(dat) {
     )
 
   period_starters <- substitutions %>%
-    group_by(period, player_team) %>%
+    group_by(period) %>%
     summarize(
       event_id = list(c(event_id)),
       subs_on = list(c(player_on_id)),
@@ -215,14 +314,12 @@ clean_substitutions <- function(dat) {
 
   period_starters <- period_starters %>%
     mutate(
-      period_starters =
-
-        pmap(period_starters %>% select(all_players, subs_on, subs_off), find_period_starters)
+      period_starters =pmap(period_starters %>% select(all_players, subs_on, subs_off), find_period_starters)
     )
 
   players_on_court <- period_starters %>%
     select(event_id, subs_on, subs_off, period_starters) %>%
-    pmap_dfr(find_players_on_court)
+    pmap_dfr(find_players_on_court, player_reference$player_dictionary)
 
   res <- substitutions %>%
     left_join(players_on_court) %>%
@@ -276,6 +373,13 @@ find_period_starters <- function(all_players, subs_on, subs_off) {
 }
 
 find_players_on_court <- function(event_id, subs_on, subs_off, period_starters, player_dictionary) {
+
+  player_dictionary <- player_dictionary %>%
+
+    select(
+      team_id, player_team = team_abbreviation, player_name, player_id
+    )
+
 
   players_on_court <- list(
     period_starters
@@ -625,7 +729,10 @@ clean_shots <- function(dat) {
 
 }
 
-get_players_by_period <- function(periods, GameID = "0021800001", StartPeriod=0, EndPeriod = 14) {
+get_players_by_period <- function(periods, GameID = "0021800001", StartPeriod=0, EndPeriod = 14, browse = FALSE) {
+
+  if(browse) browser()
+
 
   period_table <- tibble::tibble(
     period = periods,
@@ -638,7 +745,13 @@ get_players_by_period <- function(periods, GameID = "0021800001", StartPeriod=0,
   select(-quarter, -time_in_period)
 
 
-  player_dictionary <- get_box_score(GameID = GameID, StartPeriod = 1, EndPeriod = 14, StartRange = min(period_table$start_range), EndRange = max(period_table$end_range))
+  player_dictionary <- get_box_score(
+    GameID = GameID,
+    StartPeriod = 1,
+    EndPeriod = 14,
+    StartRange = min(period_table$start_range),
+    EndRange = max(period_table$end_range)
+  )
 
 
   players_by_period <- period_table %>%
@@ -656,21 +769,21 @@ get_players_by_period <- function(periods, GameID = "0021800001", StartPeriod=0,
 
         select(
           player_id,
-          player_team
+          player_team = team_abbreviation
         )
       )
     ) %>%
     unnest() %>%
     select(-start_range, -end_range) %>%
-    group_by(period, player_team) %>%
+    group_by(period) %>%
     nest(.key = "all_players") %>%
     mutate(
       all_players = all_players %>% map(unlist) %>% map(unname)
     )
 
   res <- list(
-    player_dictionary,
-    players_by_period
+    player_dictionary = player_dictionary,
+    players_by_period = players_by_period
   )
 
   res
@@ -692,37 +805,129 @@ get_box_score <- function(GameID, StartPeriod, EndPeriod, StartRange = "", EndRa
 
 }
 
+cookie <- ""
 
-make_nba_stats_request <- function(endpoint = "playbyplayv2", ..., debug_url = FALSE) {
+make_nba_stats_request <- function(endpoint = "playbyplayv2", ..., debug_url = FALSE, browse = FALSE) {
 
   params <- list(...)
 
+  if(browse) browser()
+
   query_string <- paste(names(params), unlist(params), sep = "=", collapse = "&")
 
-  url <- glue::glue("https://stats.nba.com/stats/{endpoint}?{query_string}")
+  url <-
+
+    glue::glue(
+      "https://stats.nba.com/stats/{endpoint}?{query_string}"
+    ) %>%
+
+    URLencode()
+
+  meta <- curl::new_handle() %>%
+    curl::handle_setheaders(
+      'Host'= 'stats.nba.com',
+      'User-Agent'= 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.132 Safari/537.36',
+      'Accept'= 'application/json, text/plain, */*',
+      'Accept-Language'= 'en-US,en;q=0.5',
+      'Accept-Encoding'= 'gzip, deflate, br',
+      'Connection'= 'keep-alive',
+      'cookie' = cookie
+    )
 
   if(debug_url) return(url)
 
-  res <- jsonlite::fromJSON(readLines(curl::curl(url)))
+  cat(".")
+
+  request_time <- Sys.time()
+  req <- curl::curl_fetch_memory(url, handle = meta)
+  response_time <- Sys.time()
+  time_diff <- round(response_time - request_time, 3)
+
+  cookie <<- req$headers %>% rawToChar() %>% str_extract("ak_bmsc[^;]+")
+
+  message(glue::glue("\nroundtrip time: {time_diff} seconds"))
+
+  content <- req$content %>% rawToChar()
+
+  if(content %>% str_detect("<!DOCTYPE html>")) {
+
+    message(glue::glue("malformed url: {url}"))
+    return(NULL)
+
+  }
+
+  res <- jsonlite::fromJSON(rawToChar(req$content))
 
   res
 
 
 }
 
-make_nba_stats_request_httr <- function(endpoint = "playbyplayv2", ..., debug_url = FALSE) {
 
-  params <- list(...)
+drop_events_before_time_out <- function(posession) {
 
-  query_string <- paste(names(params), unlist(params), sep = "=", collapse = "&")
+  if(!("Time Out" %in% posession$event_category)) {
 
-  url <- glue::glue("https://stats.nba.com/stats/{endpoint}")
+    res <- posession
 
-  if(debug_url) return(url)
+  } else if(first(posession$event_category) == "Time Out") {
 
-  res <- httr::GET(url, query = params)
+    res <- posession
+
+  } else {
+
+    first_time_out_index <- which(posession$event_category == "Time Out")[1]
+
+    res <- poasession %>%
+
+      filter(row_number() >= first_time_out_index)
+
+  }
 
   res
 
+}
+
+fill_players_on_court <- function(dat) {
+
+  res <- dat %>%
+
+
+    fill(players_on_court_before, .direction = "up") %>%
+    fill(players_on_court_after, .direction = "down") %>%
+
+    mutate(
+      players_on_court = map2(
+        players_on_court_after,
+        players_on_court_before,
+        ~ if(is_tibble(.x)) {
+          .x
+        } else {
+          .y
+        }
+      )
+    ) %>%
+
+    select(
+      -matches("players_on_court_")
+    )
+
+  res
 
 }
+
+find_posession_number <- function(dat) {
+
+  res <- dat %>%
+    mutate(
+      posession_end =
+        shot_made %in% TRUE |
+        event_category %in% c("Turnover", "Rebound Opportunity"),
+      posession_change =
+        posession_end &
+        !(event_detail %in% "Offensive"),
+      posession_number = lag(cumsum(posession_end), default = 0) + 1
+    )
+
+}
+
