@@ -1,3 +1,8 @@
+clean_rapm_matrix <- function(posession_players, posession_team) {
+
+
+}
+
 
 get_posessions <- function(GameID = "0021800001") {
 
@@ -74,9 +79,13 @@ clean_game_time <- function(period, time_remaining) {
 
 }
 
-clean_posessions <- function(play_by_play_data) {
+clean_posessions <- function(play_by_play_data, game_id) {
 
 
+  # if(file.exists(glue::glue("data/cache/clean/posessions/{game_id}.rds"))) {
+  #
+  #   return(read_rds(glue::glue("data/cache/clean/posessions/{game_id}.rds")))
+  # }
 
   # so, we can filter out steals and blocks, or
   # consider collapsing them into turnovers and missed shots
@@ -117,15 +126,18 @@ clean_posessions <- function(play_by_play_data) {
 
     group_by(
       posession_team,
-      posession_number,
-      posession_end
+      posession_number
     ) %>%
 
-    nest() %>%
+    nest()
+
+  dat <- dat %>%
+
+    ungroup() %>%
 
     mutate(
       data = data %>% map(drop_events_before_time_out),
-      shot = data %>% map(~ .x %>% filter(event_category %in% c("Field Goal Attempt", "Free Throws"))),
+      shot = data %>% map(~ .x %>% filter(event_category %in% c("Field Goal Attempt", "Free Throws", "Turnover")) %>% summarize_all(last)),
       posession_end_event = data %>% map_chr(~ .x %>% pull(event_category) %>% last()),
       posession_start_event = lag(posession_end_event, default = "Tip-off"),
       posession_time_out = data %>% map_lgl(~ "Time Out" %in% .x$event_category),
@@ -134,7 +146,7 @@ clean_posessions <- function(play_by_play_data) {
     rename(
       plays = data
     ) %>%
-    unnest(shot) %>%
+    unnest(shot, keep_empty = TRUE) %>%
     mutate(
       game_id = str_sub(event_id, 1, -5),
       posession_id = str_c(game_id, str_pad(posession_number, 4, "left"))
@@ -149,16 +161,34 @@ clean_posessions <- function(play_by_play_data) {
       posession_start_event,
       posession_end_event,
       everything()
+    ) %>%
+    mutate(
+      players_on_court = players_on_court %>% map2(lead(players_on_court), ~ if(!is_tibble(.x)) {.y} else {.x}),
+      players_on_court = players_on_court %>% map2(posession_team, ~ mutate(.x, on_court_value = ifelse(player_team == .y, 1, -1)))
     )
 
   res <- dat
+
+  write_rds(res, glue::glue("data/cache/clean/posessions/{game_id}.rds"))
 
   res
 
 
 }
 
-clean_play_by_play <- function(play_by_play_response) {
+clean_play_by_play <- function(play_by_play_response, browse = FALSE) {
+
+
+  if(browse) browser()
+
+  game_id <- play_by_play_response$GAME_ID[1]
+
+  if(file.exists(glue::glue("data/cache/clean/play-by-play/{game_id}.rds"))) {
+
+    res <- read_rds(glue::glue("data/cache/clean/play-by-play/{game_id}.rds"))
+
+    return(res)
+  }
 
   dat <- play_by_play_response %>%
 
@@ -183,30 +213,17 @@ clean_play_by_play <- function(play_by_play_response) {
     )
 
   # clean tables for different types of events
-  tables <- list(
+  tables <- list()
 
-    # field goals and free throws
-    shots = clean_shots(dat),
 
-    # turnovers
-    turnovers = clean_turnovers(dat),
+  tables$shots = clean_shots(dat)
+  tables$turnovers = clean_turnovers(dat)
+  tables$rebounds = clean_rebounds(dat)
+  tables$blocks = clean_blocks(dat)
+  tables$steals = clean_steals(dat)
+  tables$substitutions = clean_substitutions(dat, game_id = game_id)
+  tables$timeouts = clean_timeouts(dat)
 
-    # rebounds
-    rebounds = clean_rebounds(dat),
-
-    # blocks
-    blocks = clean_blocks(dat),
-
-    # steals
-    steals = clean_steals(dat),
-
-    # substitutions
-    substitutions = clean_substitutions(dat),
-
-    # timeouts
-    timeouts = clean_timeouts(dat)
-
-  )
 
   res <- tables %>%
     bind_rows() %>%
@@ -219,6 +236,8 @@ clean_play_by_play <- function(play_by_play_response) {
     fill_players_on_court() %>%
     drop_first_ft_rebounds() %>%
     fill_home_away_teams()
+
+  write_rds(res, glue::glue("data/cache/clean/play-by-play/{game_id}.rds"))
 
   res
 
@@ -271,12 +290,14 @@ clean_timeouts <- function(dat) {
 
 }
 
-clean_substitutions <- function(dat) {
+clean_substitutions <- function(dat, game_id) {
+
+  #_if(browse) browser()
 
   periods_in_game <- dat$period %>% unique()
 
   # get players by quarter
-  player_reference <- get_players_by_period(periods_in_game)
+  player_reference <- get_players_by_period(periods_in_game, GameID = game_id)
 
   substitutions <- dat %>%
 
@@ -307,10 +328,12 @@ clean_substitutions <- function(dat) {
       subs_on = list(c(player_on_id)),
       subs_off = list(c(player_off_id))
     ) %>%
-    left_join(
-      player_reference$players_by_period
-    ) %>%
-    ungroup()
+
+    ungroup() %>%
+
+    mutate(
+      all_players = player_reference$players_by_period$all_players[1:max(row_number())]
+    )
 
   period_starters <- period_starters %>%
     mutate(
@@ -322,7 +345,10 @@ clean_substitutions <- function(dat) {
     pmap_dfr(find_players_on_court, player_reference$player_dictionary)
 
   res <- substitutions %>%
-    left_join(players_on_court) %>%
+    mutate(
+      players_on_court_before = players_on_court$players_on_court_before,
+      players_on_court_after = players_on_court$players_on_court_after
+    ) %>%
     group_by(period, player_name = player_team_name, seconds_played, player_team, player_type) %>%
     summarize(
       event_id = first(event_id),
@@ -789,7 +815,10 @@ get_players_by_period <- function(periods, GameID = "0021800001", StartPeriod=0,
   res
 }
 
-get_box_score <- function(GameID, StartPeriod, EndPeriod, StartRange = "", EndRange = "") {
+get_box_score <- function(GameID, StartPeriod, EndPeriod, StartRange = "", EndRange = "", browse = FALSE) {
+
+
+  if(browse) browser()
 
   raw <- make_nba_stats_request("boxscoreadvancedv2", GameID = GameID, StartPeriod = StartPeriod, EndPeriod = EndPeriod, StartRange = StartRange, EndRange = EndRange, RangeType = 2, debug_url = FALSE)
 
@@ -836,18 +865,28 @@ make_nba_stats_request <- function(endpoint = "playbyplayv2", ..., debug_url = F
 
   if(debug_url) return(url)
 
-  cat(".")
-
   request_time <- Sys.time()
-  req <- curl::curl_fetch_memory(url, handle = meta)
-  response_time <- Sys.time()
-  time_diff <- round(response_time - request_time, 3)
 
-  cookie <<- req$headers %>% rawToChar() %>% str_extract("ak_bmsc[^;]+")
+  if(!dir.exists(glue::glue("data/cache/{endpoint}"))) {
+    dir.create(glue::glue("data/cache/{endpoint}"))
+  }
 
-  message(glue::glue("\nroundtrip time: {time_diff} seconds"))
+  if(!file.exists(glue::glue("data/cache/{endpoint}/{query_string}"))) {
 
-  content <- req$content %>% rawToChar()
+    req <- curl::curl_fetch_disk(url,path = glue::glue("data/cache/{endpoint}/{query_string}"), handle = meta)
+    response_time <- Sys.time()
+    time_diff <- round(response_time - request_time, 3)
+
+    cookie <<- req$headers %>% rawToChar() %>% str_extract("ak_bmsc[^;]+")
+
+
+    message(glue::glue("\nroundtrip time: {time_diff} seconds"))
+
+    content <- req$content %>% read_file()
+  }
+
+  content <- read_file(glue::glue("data/cache/{endpoint}/{query_string}"))
+
 
   if(content %>% str_detect("<!DOCTYPE html>")) {
 
@@ -856,7 +895,7 @@ make_nba_stats_request <- function(endpoint = "playbyplayv2", ..., debug_url = F
 
   }
 
-  res <- jsonlite::fromJSON(rawToChar(req$content))
+  res <- jsonlite::fromJSON(content)
 
   res
 
@@ -878,7 +917,7 @@ drop_events_before_time_out <- function(posession) {
 
     first_time_out_index <- which(posession$event_category == "Time Out")[1]
 
-    res <- poasession %>%
+    res <- posession %>%
 
       filter(row_number() >= first_time_out_index)
 
